@@ -92,9 +92,10 @@ def is_active_user(telegram_id: int) -> bool:
     exp = rows[0]["subscription_expires_at"]
     if not exp:
         return False
-    # اگر tzinfo نداشت، UTC بده
+    # exp باید timezone-aware باشد؛ اگر نبود، UTC بده
     if getattr(exp, "tzinfo", None) is None:
         exp = exp.replace(tzinfo=datetime.timezone.utc)
+    # now هم timezone-aware است (تابع بالا)
     return now_dt() <= exp
 
 
