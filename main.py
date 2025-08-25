@@ -40,7 +40,9 @@ def utcnow() -> str:
     return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def now_dt() -> datetime.datetime:
-    return datetime.datetime.utcnow()
+    # همیشه datetime با timezone (UTC) برگردون
+    return datetime.datetime.now(datetime.timezone.utc)
+
 
 def add_days(dt: datetime.datetime, days: int) -> datetime.datetime:
     return dt + datetime.timedelta(days=days)
@@ -85,9 +87,16 @@ def init_db():
 
 def is_active_user(telegram_id: int) -> bool:
     rows = db_exec("SELECT subscription_expires_at FROM users WHERE telegram_id=%s", (telegram_id,))
-    if not rows: return False
+    if not rows:
+        return False
     exp = rows[0]["subscription_expires_at"]
-    return bool(exp and now_dt() <= exp)
+    if not exp:
+        return False
+    # اگر tzinfo نداشت، UTC بده
+    if getattr(exp, "tzinfo", None) is None:
+        exp = exp.replace(tzinfo=datetime.timezone.utc)
+    return now_dt() <= exp
+
 
 def ensure_trial(telegram_id: int):
     rows = db_exec("SELECT trial_started_at, subscription_expires_at FROM users WHERE telegram_id=%s", (telegram_id,))
