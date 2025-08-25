@@ -1,16 +1,17 @@
-import os, datetime
+import os, re, json, datetime
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import httpx
 import psycopg2, psycopg2.extras
+from zoneinfo import ZoneInfo
+import jdatetime
+from fastapi.responses import HTMLResponse
 
 load_dotenv()
 
-# ===== Env =====
-from fastapi.responses import HTMLResponse
-ADMIN_PANEL_TOKEN = os.getenv("ADMIN_PANEL_TOKEN", "")
+# ===================== ENV =====================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
@@ -19,13 +20,34 @@ TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
 PAYMENT_ADDRESS = os.getenv("PAYMENT_ADDRESS", "YOUR_USDT_ADDRESS")
 PAYMENT_NETWORK = os.getenv("PAYMENT_NETWORK", "TRC20")
 DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_PANEL_TOKEN = os.getenv("ADMIN_PANEL_TOKEN", "")
 
 if not (BOT_TOKEN and WEBHOOK_SECRET and TELEGRAM_WEBHOOK_SECRET and DATABASE_URL):
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN, WEBHOOK_SECRET, TELEGRAM_WEBHOOK_SECRET, DATABASE_URL")
 
-app = FastAPI(title="SourceTrader MVP")
+app = FastAPI(title="SourceTrader MVP (FA + Jalali)")
 
-# ===== DB helpers (Postgres) =====
+# ===================== TIME HELPERS =====================
+TEHRAN = ZoneInfo("Asia/Tehran")
+
+def now_dt() -> datetime.datetime:
+    # tz-aware (UTC)
+    return datetime.datetime.now(datetime.timezone.utc)
+
+def to_tehran(dt: datetime.datetime) -> datetime.datetime:
+    # normalize to Tehran tz
+    if getattr(dt, "tzinfo", None) is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(TEHRAN)
+
+def jalali_str(dt: datetime.datetime, with_time: bool = True) -> str:
+    dt_th = to_tehran(dt)
+    j = jdatetime.datetime.fromgregorian(datetime=dt_th)
+    if with_time:
+        return f"{j.strftime('%Y/%m/%d')} - {dt_th.strftime('%H:%M')}"
+    return j.strftime('%Y/%m/%d')
+
+# ===================== DB (Postgres) =====================
 def db_conn():
     return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
@@ -37,17 +59,6 @@ def db_exec(q, args=()):
                 return cur.fetchall()
             except psycopg2.ProgrammingError:
                 return None
-
-def utcnow() -> str:
-    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-def now_dt() -> datetime.datetime:
-    # همیشه datetime با timezone (UTC) برگردون
-    return datetime.datetime.now(datetime.timezone.utc)
-
-
-def add_days(dt: datetime.datetime, days: int) -> datetime.datetime:
-    return dt + datetime.timedelta(days=days)
 
 def init_db():
     db_exec("""
@@ -75,7 +86,7 @@ def init_db():
         status TEXT, created_at TIMESTAMPTZ
     );
     """)
-    # ثبت ادمین‌ها
+    # seed admins
     now = now_dt()
     for aid in ADMIN_IDS:
         try:
@@ -89,24 +100,19 @@ def init_db():
 
 def is_active_user(telegram_id: int) -> bool:
     rows = db_exec("SELECT subscription_expires_at FROM users WHERE telegram_id=%s", (telegram_id,))
-    if not rows:
-        return False
+    if not rows: return False
     exp = rows[0]["subscription_expires_at"]
-    if not exp:
-        return False
-    # exp باید timezone-aware باشد؛ اگر نبود، UTC بده
+    if not exp: return False
     if getattr(exp, "tzinfo", None) is None:
         exp = exp.replace(tzinfo=datetime.timezone.utc)
-    # now هم timezone-aware است (تابع بالا)
     return now_dt() <= exp
-
 
 def ensure_trial(telegram_id: int):
     rows = db_exec("SELECT trial_started_at, subscription_expires_at FROM users WHERE telegram_id=%s", (telegram_id,))
     if not rows: return
     if rows[0]["trial_started_at"]: return
     start = now_dt()
-    exp = add_days(start, TRIAL_DAYS)
+    exp = start + datetime.timedelta(days=TRIAL_DAYS)
     db_exec("UPDATE users SET trial_started_at=%s, subscription_expires_at=%s WHERE telegram_id=%s",
             (start, exp, telegram_id))
 
@@ -117,17 +123,20 @@ def extend_subscription(telegram_id: int, days: int):
         cur_exp = rows[0]["subscription_expires_at"]
         if cur_exp and cur_exp > base:
             base = cur_exp
-    new_exp = add_days(base, days)
+    new_exp = base + datetime.timedelta(days=days)
     db_exec("UPDATE users SET subscription_expires_at=%s WHERE telegram_id=%s", (new_exp, telegram_id))
     return new_exp
 
 def list_active_users() -> List[int]:
-    rows = db_exec("SELECT telegram_id, subscription_expires_at FROM users", ())
+    rows = db_exec("SELECT telegram_id, subscription_expires_at FROM users")
     res = []
     for r in rows or []:
         exp = r["subscription_expires_at"]
-        if exp and now_dt() <= exp:
-            res.append(int(r["telegram_id"]))
+        if exp and (getattr(exp, "tzinfo", None) or True):
+            if getattr(exp, "tzinfo", None) is None:
+                exp = exp.replace(tzinfo=datetime.timezone.utc)
+            if now_dt() <= exp:
+                res.append(int(r["telegram_id"]))
     return res
 
 def save_signal(symbol: str, side: str, price, t: str) -> int:
@@ -137,30 +146,41 @@ def save_signal(symbol: str, side: str, price, t: str) -> int:
     """, (symbol, side, price, t or "", now_dt()))
     return rows[0]["id"] if rows else 0
 
-# ===== Telegram helpers =====
-async def tg_send(chat_id: int, text: str, parse_mode: Optional[str] = "HTML"):
+# ===================== TELEGRAM HELPERS =====================
+async def tg_send(chat_id: int, text: str, parse_mode: Optional[str] = "HTML", reply_markup: Optional[dict] = None):
     async with httpx.AsyncClient(timeout=20) as client:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         data = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
         if parse_mode: data["parse_mode"] = parse_mode
+        if reply_markup: data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
         await client.post(url, data=data)
 
 async def tg_send_to_admins(text: str):
     for aid in ADMIN_IDS:
-        try: await tg_send(int(aid), text)
-        except: pass
+        try:
+            await tg_send(int(aid), text)
+        except Exception:
+            pass
 
 def format_signal(title, symbol, side, price, t):
     price_str = f"{price:.8f}" if isinstance(price, (int,float)) else "N/A"
+    now_text = jalali_str(now_dt(), with_time=True)
     return (
         f"📡 <b>{title}</b>\n"
-        f"🔹 Symbol: <b>{symbol}</b>\n"
-        f"🔸 Side: <b>{side.upper()}</b>\n"
-        f"💲 Price: <b>{price_str}</b>\n"
-        f"🕒 Time: <code>{t or ''}</code>"
+        f"📌 نماد: <b>{symbol}</b>\n"
+        f"🧭 جهت: <b>{side.upper()}</b>\n"
+        f"💲 قیمت: <b>{price_str}</b>\n"
+        f"🕒 زمان ارسال: <code>{now_text}</code>"
     )
 
-# ===== Models =====
+def extract_txid(text: str) -> Optional[str]:
+    if not text: return None
+    text = text.strip()
+    # پیدا کردن رشته هگز طولانی (با/بی '0x') داخل متن یا URL
+    m = re.search(r'(0x)?[A-Fa-f0-9]{32,}', text)
+    return m.group(0) if m else None
+
+# ===================== MODELS =====================
 class TVPayload(BaseModel):
     strategy: Optional[str] = None
     symbol:   Optional[str] = None
@@ -169,15 +189,15 @@ class TVPayload(BaseModel):
     time:     Optional[str] = None
     secret:   Optional[str] = None
 
-# ===== Startup =====
+# ===================== STARTUP =====================
 init_db()
 
-# ===== Health =====
+# ===================== ROUTES =====================
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# ===== TradingView Webhook (or manual test) =====
+# TradingView (یا تست دستی)
 @app.post("/tv")
 async def tv_hook(payload: TVPayload):
     if payload.secret != WEBHOOK_SECRET:
@@ -188,20 +208,19 @@ async def tv_hook(payload: TVPayload):
     sid = save_signal(symbol, side, payload.price, payload.time)
     text = format_signal(title, symbol, side, payload.price, payload.time)
 
-    # ارسال برای کاربران فعال
     users = list_active_users()
     async with httpx.AsyncClient(timeout=20) as client:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         for uid in users:
             try:
                 await client.post(url, data={"chat_id": uid, "text": text, "parse_mode":"HTML","disable_web_page_preview":True})
-            except: pass
+            except Exception:
+                pass
     return {"ok": True, "id": sid, "delivered_to": len(users)}
 
-# ===== Telegram Webhook (commands) =====
+# Telegram webhook
 @app.post("/tg/webhook")
 async def tg_webhook(req: Request):
-    # امنیت ساده: Secret Token در هدر
     sec = req.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     if sec != TELEGRAM_WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="invalid telegram secret")
@@ -215,23 +234,23 @@ async def tg_webhook(req: Request):
     username = from_user.get("username"); first = from_user.get("first_name"); last = from_user.get("last_name")
     if not chat_id or not uid: return {"ok": True}
 
-    # ثبت/بروزرسانی کاربر
-    now = now_dt()
+    # register/update user
     db_exec("""
     INSERT INTO users(telegram_id, username, first_name, last_name, joined_at)
     VALUES (%s,%s,%s,%s,%s)
     ON CONFLICT (telegram_id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name
-    """, (uid, username, first, last, now))
+    """, (uid, username, first, last, now_dt()))
 
-    # دستورات
+    # commands
     if text.startswith("/start"):
         ensure_trial(uid)
         row = db_exec("SELECT subscription_expires_at FROM users WHERE telegram_id=%s", (uid,))
         exp = row[0]["subscription_expires_at"] if row else None
+        exp_txt = jalali_str(exp, with_time=True) if exp else "N/A"
         msg = (
             "👋 به ربات سیگنال خوش آمدی!\n\n"
             f"✅ {TRIAL_DAYS} روز اشتراک رایگان برای تست فعال شد.\n"
-            f"⏰ انقضا: <b>{exp or 'N/A'}</b>\n\n"
+            f"⏰ انقضا: <b>{exp_txt}</b>\n\n"
             "دستورات:\n"
             "/last - آخرین سیگنال‌ها\n"
             "/status - وضعیت اشتراک\n"
@@ -255,7 +274,8 @@ async def tg_webhook(req: Request):
         row = db_exec("SELECT subscription_expires_at FROM users WHERE telegram_id=%s", (uid,))
         exp = row[0]["subscription_expires_at"] if row else None
         active = "✅ فعال" if is_active_user(uid) else "⛔️ غیرفعال"
-        await tg_send(chat_id, f"وضعیت اشتراک: {active}\nانقضا: <b>{exp or 'N/A'}</b>"); return {"ok": True}
+        exp_txt = jalali_str(exp, with_time=True) if exp else "N/A"
+        await tg_send(chat_id, f"وضعیت اشتراک: {active}\nانقضا: <b>{exp_txt}</b>"); return {"ok": True}
 
     if text.startswith("/last"):
         rows = db_exec("SELECT symbol, side, price, time, created_at FROM signals ORDER BY id DESC LIMIT 5")
@@ -264,18 +284,28 @@ async def tg_webhook(req: Request):
         lines = []
         for r in rows:
             price = r["price"] if r["price"] is not None else "N/A"
-            lines.append(f"• {r['symbol']} | {r['side']} | {price} | {r['time'] or r['created_at']}")
+            created = r["created_at"]
+            created_text = jalali_str(created, with_time=True) if created else "-"
+            lines.append(f"• {r['symbol']} | {r['side']} | {price} | {created_text}")
         await tg_send(chat_id, "📈 آخرین سیگنال‌ها:\n" + "\n".join(lines)); return {"ok": True}
 
     if text.startswith("/subscribe"):
         msg = (
-            "💳 تمدید اشتراک:\n"
-            f"• آدرس پرداخت: <code>{PAYMENT_ADDRESS}</code>\n"
-            f"• شبکه: <b>{PAYMENT_NETWORK}</b>\n"
-            "• پس از پرداخت، TXID را با دستور /tx وارد کنید.\n"
-            "مثال: /tx f1a2b3c4...\n"
+            "💳 تمدید اشتراک (ساده):\n"
+            f"1) مبلغ را به آدرس زیر بفرست:\n"
+            f"   • آدرس: <code>{PAYMENT_ADDRESS}</code>\n"
+            f"   • شبکه: <b>{PAYMENT_NETWORK}</b>\n"
+            "2) بعد از پرداخت، همین‌جا «هش تراکنش یا لینک اکسپلورر» را بفرست.\n"
+            "   (نیازی به فرمت خاص نیست، فقط بفرست.)\n"
+            "3) ما بررسی و تایید می‌کنیم. ✅"
         )
-        await tg_send(chat_id, msg); return {"ok": True}
+        buttons = {
+            "inline_keyboard": [
+                [{"text": "📋 کپی آدرس", "switch_inline_query_current_chat": PAYMENT_ADDRESS}],
+                [{"text": "🧭 Tronscan", "url": "https://tronscan.org/"}]
+            ]
+        }
+        await tg_send(chat_id, msg, reply_markup=buttons); return {"ok": True}
 
     if text.startswith("/tx"):
         parts = text.split()
@@ -286,7 +316,7 @@ async def tg_webhook(req: Request):
         await tg_send(chat_id, "✅ درخواست تمدید ثبت شد. پس از تأیید، اشتراک تمدید می‌شود.")
         await tg_send_to_admins(f"🧾 پرداخت جدید:\nUser: {uid}\nTXID: {txid}\nتایید: /confirm {uid} 30"); return {"ok": True}
 
-    # دستورات ادمین
+    # Admin commands
     if text.startswith("/confirm"):
         if str(uid) not in ADMIN_IDS:
             await tg_send(chat_id, "⛔️ فقط ادمین."); return {"ok": True}
@@ -297,8 +327,8 @@ async def tg_webhook(req: Request):
             target, days = int(parts[1]), int(parts[2])
             new_exp = extend_subscription(target, days)
             db_exec("UPDATE payments SET status='approved' WHERE telegram_id=%s AND status='pending'", (target,))
-            await tg_send(chat_id, f"✅ تمدید شد تا: <b>{new_exp.strftime('%Y-%m-%dT%H:%M:%SZ')}</b>")
-            await tg_send(target, f"🎉 اشتراک شما تمدید شد تا: <b>{new_exp.strftime('%Y-%m-%dT%H:%M:%SZ')}</b>")
+            await tg_send(chat_id, f"✅ تمدید شد تا: <b>{jalali_str(new_exp, with_time=True)}</b>")
+            await tg_send(target, f"🎉 اشتراک شما تمدید شد تا: <b>{jalali_str(new_exp, with_time=True)}</b>")
         except Exception as e:
             await tg_send(chat_id, f"خطا در تایید: {e}")
         return {"ok": True}
@@ -307,33 +337,61 @@ async def tg_webhook(req: Request):
         if str(uid) not in ADMIN_IDS:
             await tg_send(chat_id, "⛔️ فقط ادمین."); return {"ok": True}
         msg = text.replace("/broadcast", "", 1).strip()
-        if not msg: await tg_send(chat_id, "متن خالی است."); return {"ok": True}
-        rows = db_exec("SELECT telegram_id FROM users", ())
+        if not msg:
+            await tg_send(chat_id, "متن خالی است."); return {"ok": True}
+        rows = db_exec("SELECT telegram_id FROM users")
         for r in rows or []:
             try: await tg_send(int(r["telegram_id"]), f"📢 {msg}")
             except: pass
         await tg_send(chat_id, "✅ ارسال شد."); return {"ok": True}
 
+    # اگر متن دستور نبود، بررسی کن شاید TXID داخل متن باشد
+    tx_guess = extract_txid(text)
+    if tx_guess:
+        db_exec("INSERT INTO payments(telegram_id, txid, status, created_at) VALUES (%s,%s,'pending',%s)",
+                (uid, tx_guess, now_dt()))
+        await tg_send(chat_id, "✅ درخواست تمدید ثبت شد. پس از تأیید، اشتراک شما تمدید می‌شود.")
+        await tg_send_to_admins(f"🧾 پرداخت جدید:\nUser: {uid}\nTXID: {tx_guess}\nتایید: /confirm {uid} 30")
+        return {"ok": True}
+
+    # پیش‌فرض
     await tg_send(chat_id, "دستور نامعتبر. /help را ببین."); return {"ok": True}
 
+# ===================== SIMPLE ADMIN PANEL (optional) =====================
 @app.get("/admin", response_class=HTMLResponse)
 def admin_home(token: str):
     if not ADMIN_PANEL_TOKEN or token != ADMIN_PANEL_TOKEN:
         return HTMLResponse("<h3>Unauthorized</h3>", status_code=401)
-    users = db_exec("SELECT telegram_id, username, subscription_expires_at, is_admin FROM users ORDER BY subscription_expires_at DESC NULLS LAST")
+    users = db_exec("SELECT telegram_id, username, subscription_expires_at, is_admin, joined_at FROM users ORDER BY subscription_expires_at DESC NULLS LAST")
     pays  = db_exec("SELECT id, telegram_id, txid, status, created_at FROM payments ORDER BY id DESC LIMIT 50")
     sigs  = db_exec("SELECT id, symbol, side, price, time, created_at FROM signals ORDER BY id DESC LIMIT 50")
+
     def row(tds): return "<tr>" + "".join([f"<td>{td}</td>" for td in tds]) + "</tr>"
-    html = ["<html><head><meta charset='utf-8'><style>table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:6px;font-family:Arial;font-size:13px}</style></head><body>"]
-    html += ["<h2>Admin Panel</h2>",
-             "<h3>Users</h3><table><tr><th>ID</th><th>Username</th><th>Expires</th><th>Admin</th></tr>"]
+
+    html = ["<html><head><meta charset='utf-8'><title>Admin</title>"
+            "<style>table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:6px;font-family:Arial;font-size:13px}</style>"
+            "</head><body>"]
+    html.append("<h2>Admin Panel</h2>")
+
+    html.append("<h3>Users</h3><table><tr><th>ID</th><th>Username</th><th>Joined</th><th>Expires</th><th>Admin</th></tr>")
     for u in users or []:
-        html.append(row([u['telegram_id'], u.get('username',''), u.get('subscription_expires_at',''), "✅" if u.get('is_admin') else "—"]))
-    html += ["</table><h3>Payments (last 50)</h3><table><tr><th>ID</th><th>User</th><th>TXID</th><th>Status</th><th>Created</th></tr>"]
+        joined = u.get('joined_at'); exp = u.get('subscription_expires_at')
+        joined_txt = jalali_str(joined, True) if joined else "-"
+        exp_txt = jalali_str(exp, True) if exp else "-"
+        html.append(row([u['telegram_id'], u.get('username',''), joined_txt, exp_txt, "✅" if u.get('is_admin') else "—"]))
+    html.append("</table>")
+
+    html.append("<h3>Payments (last 50)</h3><table><tr><th>ID</th><th>User</th><th>TXID</th><th>Status</th><th>Created</th></tr>")
     for p in pays or []:
-        html.append(row([p['id'], p['telegram_id'], p['txid'], p['status'], p['created_at']]))
-    html += ["</table><h3>Signals (last 50)</h3><table><tr><th>ID</th><th>Symbol</th><th>Side</th><th>Price</th><th>Time</th><th>Created</th></tr>"]
+        created_txt = jalali_str(p['created_at'], True) if p.get('created_at') else "-"
+        html.append(row([p['id'], p['telegram_id'], p['txid'], p['status'], created_txt]))
+    html.append("</table>")
+
+    html.append("<h3>Signals (last 50)</h3><table><tr><th>ID</th><th>Symbol</th><th>Side</th><th>Price</th><th>Created</th></tr>")
     for s in sigs or []:
-        html.append(row([s['id'], s['symbol'], s['side'], s.get('price',''), s.get('time',''), s['created_at']]))
-    html.append("</table></body></html>")
+        created_txt = jalali_str(s['created_at'], True) if s.get('created_at') else "-"
+        html.append(row([s['id'], s['symbol'], s['side'], s.get('price',''), created_txt]))
+    html.append("</table>")
+
+    html.append("</body></html>")
     return "".join(html)
