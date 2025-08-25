@@ -9,6 +9,8 @@ import psycopg2, psycopg2.extras
 load_dotenv()
 
 # ===== Env =====
+from fastapi.responses import HTMLResponse
+ADMIN_PANEL_TOKEN = os.getenv("ADMIN_PANEL_TOKEN", "")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
@@ -313,3 +315,25 @@ async def tg_webhook(req: Request):
         await tg_send(chat_id, "✅ ارسال شد."); return {"ok": True}
 
     await tg_send(chat_id, "دستور نامعتبر. /help را ببین."); return {"ok": True}
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_home(token: str):
+    if not ADMIN_PANEL_TOKEN or token != ADMIN_PANEL_TOKEN:
+        return HTMLResponse("<h3>Unauthorized</h3>", status_code=401)
+    users = db_exec("SELECT telegram_id, username, subscription_expires_at, is_admin FROM users ORDER BY subscription_expires_at DESC NULLS LAST")
+    pays  = db_exec("SELECT id, telegram_id, txid, status, created_at FROM payments ORDER BY id DESC LIMIT 50")
+    sigs  = db_exec("SELECT id, symbol, side, price, time, created_at FROM signals ORDER BY id DESC LIMIT 50")
+    def row(tds): return "<tr>" + "".join([f"<td>{td}</td>" for td in tds]) + "</tr>"
+    html = ["<html><head><meta charset='utf-8'><style>table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:6px;font-family:Arial;font-size:13px}</style></head><body>"]
+    html += ["<h2>Admin Panel</h2>",
+             "<h3>Users</h3><table><tr><th>ID</th><th>Username</th><th>Expires</th><th>Admin</th></tr>"]
+    for u in users or []:
+        html.append(row([u['telegram_id'], u.get('username',''), u.get('subscription_expires_at',''), "✅" if u.get('is_admin') else "—"]))
+    html += ["</table><h3>Payments (last 50)</h3><table><tr><th>ID</th><th>User</th><th>TXID</th><th>Status</th><th>Created</th></tr>"]
+    for p in pays or []:
+        html.append(row([p['id'], p['telegram_id'], p['txid'], p['status'], p['created_at']]))
+    html += ["</table><h3>Signals (last 50)</h3><table><tr><th>ID</th><th>Symbol</th><th>Side</th><th>Price</th><th>Time</th><th>Created</th></tr>"]
+    for s in sigs or []:
+        html.append(row([s['id'], s['symbol'], s['side'], s.get('price',''), s.get('time',''), s['created_at']]))
+    html.append("</table></body></html>")
+    return "".join(html)
