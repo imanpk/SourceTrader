@@ -8,6 +8,7 @@ import psycopg2, psycopg2.extras
 from zoneinfo import ZoneInfo
 import jdatetime
 from fastapi.responses import HTMLResponse
+from fastapi.responses import PlainTextResponse
 
 load_dotenv()
 
@@ -195,8 +196,14 @@ init_db()
 
 # ===================== ROUTES =====================
 @app.get("/health")
-def health():
+def health_get():
     return {"status": "ok"}
+
+@app.head("/health")
+def health_head():
+    # بدنه خالی، فقط status=200
+    return PlainTextResponse("", status_code=200)
+
 
 # TradingView (یا تست دستی)
 @app.post("/tv")
