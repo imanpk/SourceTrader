@@ -7,8 +7,7 @@ import httpx
 import psycopg2, psycopg2.extras
 from zoneinfo import ZoneInfo
 import jdatetime
-from fastapi.responses import HTMLResponse
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 
 load_dotenv()
 
@@ -71,7 +70,6 @@ def init_db():
         awaiting_tx BOOLEAN DEFAULT FALSE
     );
     """)
-    # برای سازگاری با دیتابیس‌های قبلی
     db_exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS awaiting_tx BOOLEAN DEFAULT FALSE;")
     db_exec("""
     CREATE TABLE IF NOT EXISTS signals(
@@ -149,6 +147,19 @@ def save_signal(symbol: str, side: str, price, t: str) -> int:
     """, (symbol, side, price, t or "", now_dt()))
     return rows[0]["id"] if rows else 0
 
+def find_ref_open_id(symbol: str, close_side: str) -> Optional[int]:
+    # برای CLOSE_LONG آخرین LONG، برای CLOSE_SHORT آخرین SHORT را برمی‌گرداند
+    s = (close_side or "").upper()
+    open_side = "LONG" if s == "CLOSE_LONG" else "SHORT" if s == "CLOSE_SHORT" else None
+    if not open_side:
+        return None
+    rows = db_exec("""
+        SELECT id FROM signals
+        WHERE symbol=%s AND side=%s
+        ORDER BY id DESC LIMIT 1
+    """, (symbol, open_side))
+    return rows[0]["id"] if rows else None
+
 # ===================== TELEGRAM HELPERS =====================
 async def tg_send(chat_id: int, text: str, parse_mode: Optional[str] = "HTML", reply_markup: Optional[dict] = None):
     async with httpx.AsyncClient(timeout=20) as client:
@@ -165,16 +176,28 @@ async def tg_send_to_admins(text: str):
         except Exception:
             pass
 
-def format_signal(title, symbol, side, price, t):
-    price_str = f"{price:.8f}" if isinstance(price, (int,float)) else "N/A"
-    now_text = jalali_str(now_dt(), with_time=True)
-    return (
-        f"📡 <b>{title}</b>\n"
-        f"📌 نماد: <b>{symbol}</b>\n"
-        f"🧭 جهت: <b>{side.upper()}</b>\n"
-        f"💲 قیمت: <b>{price_str}</b>\n"
-        f"🕒 زمان ارسال: <code>{now_text}</code>"
-    )
+def fa_side(side: str) -> str:
+    m = {
+        "LONG": "خرید",
+        "SHORT": "فروش",
+        "CLOSE_LONG": "بستن خرید",
+        "CLOSE_SHORT": "بستن فروش",
+    }
+    return m.get((side or "").upper(), side)
+
+def format_signal(title, symbol, side, price, t, sig_id=None, sl=None, tp=None):
+    price_str = str(int(round(price))) if isinstance(price, (int, float)) else "N/A"
+    lines = []
+    lines.append(f"📡 <b>{title}</b>" + (f"  #{sig_id}" if sig_id else ""))
+    lines.append(f"📌 نماد: <b>{symbol}</b>")
+    lines.append(f"🧭 جهت: <b>{fa_side(side)}</b>")
+    lines.append(f"💲 قیمت: <b>{price_str}</b>")
+    lines.append(f"🕒 زمان ارسال: <code>{jalali_str(now_dt(), True)}</code>")
+    if sl is not None:
+        lines.append(f"⛔ حد ضرر: <b>{int(round(sl))}</b>")
+    if tp is not None:
+        lines.append(f"🎯 تارگت: <b>{int(round(tp))}</b>")
+    return "\n".join(lines)
 
 def extract_txid(text: str) -> Optional[str]:
     if not text: return None
@@ -186,35 +209,56 @@ def extract_txid(text: str) -> Optional[str]:
 class TVPayload(BaseModel):
     strategy: Optional[str] = None
     symbol:   Optional[str] = None
-    side:     Optional[str] = None   # LONG/SHORT
+    side:     Optional[str] = None   # LONG/SHORT/CLOSE_LONG/CLOSE_SHORT
     price:    Optional[float] = None
     time:     Optional[str] = None
     secret:   Optional[str] = None
+    sl:       Optional[float] = None    # اختیاری
+    tp:       Optional[float] = None    # اختیاری
+    tf:       Optional[str] = None      # اختیاری (مثلا "15")
 
 # ===================== STARTUP =====================
 init_db()
 
 # ===================== ROUTES =====================
+# Health: GET + HEAD (برای UptimeRobot رایگان)
 @app.get("/health")
 def health_get():
     return {"status": "ok"}
 
 @app.head("/health")
 def health_head():
-    # بدنه خالی، فقط status=200
     return PlainTextResponse("", status_code=200)
 
-
-# TradingView (یا تست دستی)
+# TradingView (وبهوک سیگنال‌ها)
 @app.post("/tv")
 async def tv_hook(payload: TVPayload):
     if payload.secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="invalid secret")
+
     title  = payload.strategy or "Signal"
     symbol = payload.symbol or "UNKNOWN"
     side   = (payload.side or "N/A").upper()
+
+    # ذخیره سیگنال و دریافت کد
     sid = save_signal(symbol, side, payload.price, payload.time)
-    text = format_signal(title, symbol, side, payload.price, payload.time)
+
+    # اگر Close بود، ارجاع به آخرین Open همان سمت بساز
+    if side in ("CLOSE_LONG", "CLOSE_SHORT"):
+        ref = find_ref_open_id(symbol, side)
+        if ref:
+            title = f"{title} (بستن #{ref})"
+
+    text = format_signal(
+        title=title,
+        symbol=symbol,
+        side=side,
+        price=payload.price,
+        t=payload.time,
+        sig_id=None if side.startswith("CLOSE") else sid,   # کد را فقط روی Open نشان بده
+        sl=payload.sl,
+        tp=payload.tp,
+    )
 
     users = list_active_users()
     async with httpx.AsyncClient(timeout=20) as client:
@@ -294,11 +338,12 @@ async def tg_webhook(req: Request):
             price = r["price"] if r["price"] is not None else "N/A"
             created = r["created_at"]
             created_text = jalali_str(created, with_time=True) if created else "-"
-            lines.append(f"• {r['symbol']} | {r['side']} | {price} | {created_text}")
+            # قیمت بدون اعشار
+            price_txt = str(int(round(price))) if isinstance(price, (int,float)) else price
+            lines.append(f"• {r['symbol']} | {fa_side(r['side'])} | {price_txt} | {created_text}")
         await tg_send(chat_id, "📈 آخرین سیگنال‌ها:\n" + "\n".join(lines)); return {"ok": True}
 
     if text.startswith("/subscribe"):
-        # کاربر وارد حالت «در انتظار TXID» می‌شود
         db_exec("UPDATE users SET awaiting_tx=TRUE WHERE telegram_id=%s", (uid,))
         msg = (
             "💳 تمدید اشتراک (خیلی ساده):\n"
@@ -327,7 +372,7 @@ async def tg_webhook(req: Request):
         await tg_send(chat_id, "✅ درخواست تمدید ثبت شد. پس از تأیید، اشتراک تمدید می‌شود.")
         await tg_send_to_admins(f"🧾 پرداخت جدید:\nUser: {uid}\nTXID: {txid}\nتایید: /confirm {uid} 30"); return {"ok": True}
 
-    # Admin: debug زمان‌ها و تنظیمات
+    # Admin: debug
     if text.startswith("/debug"):
         if str(uid) not in ADMIN_IDS:
             await tg_send(chat_id, "⛔️ فقط ادمین."); return {"ok": True}
@@ -376,8 +421,7 @@ async def tg_webhook(req: Request):
             except: pass
         await tg_send(chat_id, "✅ ارسال شد."); return {"ok": True}
 
-    # اگر متن دستور نبود:
-    # 1) اگر کاربر در حالت انتظار TX باشد، همین متن را به عنوان پرداخت ثبت کن (هش را استخراج کن؛ اگر نبود، خام ذخیره کن)
+    # متن آزاد: اگر کاربر در حالت انتظار TX باشد، همین را به‌عنوان پرداخت ثبت کن
     row = db_exec("SELECT awaiting_tx FROM users WHERE telegram_id=%s", (uid,))
     if row and row[0]["awaiting_tx"]:
         tx = extract_txid(text) or text
@@ -387,7 +431,7 @@ async def tg_webhook(req: Request):
         await tg_send_to_admins(f"🧾 پرداخت جدید:\nUser: {uid}\nTXID: {tx}\nتایید: /confirm {uid} 30")
         return {"ok": True}
 
-    # 2) در غیر اینصورت اگر متن شبیه TXID بود، باز هم بپذیر (quality-of-life)
+    # اگر شبیه TXID بود، به‌عنوان پرداخت ثبت کن (QoL)
     tx_guess = extract_txid(text)
     if tx_guess:
         db_exec("INSERT INTO payments(telegram_id, txid, status, created_at) VALUES (%s,%s,'pending',%s)", (uid, tx_guess, now_dt()))
@@ -431,7 +475,8 @@ def admin_home(token: str):
     html.append("<h3>Signals (last 50)</h3><table><tr><th>ID</th><th>Symbol</th><th>Side</th><th>Price</th><th>Created</th></tr>")
     for s in sigs or []:
         created_txt = jalali_str(s['created_at'], True) if s.get('created_at') else "-"
-        html.append(row([s['id'], s['symbol'], s['side'], s.get('price',''), created_txt]))
+        price_txt = str(int(round(s['price']))) if isinstance(s.get('price'), (int,float)) else s.get('price','')
+        html.append(row([s['id'], s['symbol'], fa_side(s['side']), price_txt, created_txt]))
     html.append("</table>")
 
     html.append("</body></html>")
