@@ -1,335 +1,409 @@
-import os, re, json, datetime
-from typing import Optional, List, Tuple
-from fastapi import FastAPI, HTTPException, Request, Query
+# main.py
+# -*- coding: utf-8 -*-
+
+import os
+import json
+import math
+import traceback
+from datetime import datetime, timedelta, timezone
+
+import httpx
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, Request, Header, Query
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import httpx
-import psycopg2, psycopg2.extras
-from zoneinfo import ZoneInfo
+import pytz
 import jdatetime
-from fastapi.responses import HTMLResponse, PlainTextResponse
 
+# ─────────────────────────────────────────────────────────────
+# Load env & Settings
+# ─────────────────────────────────────────────────────────────
 load_dotenv()
 
-# ===================== ENV =====================
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TG_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
-ADMIN_IDS = [i.strip() for i in os.getenv("ADMIN_IDS", "").split(",") if i.strip()]
-TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
-PAYMENT_ADDRESS = os.getenv("PAYMENT_ADDRESS", "YOUR_USDT_ADDRESS")
-PAYMENT_NETWORK = os.getenv("PAYMENT_NETWORK", "TRC20")
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 ADMIN_PANEL_TOKEN = os.getenv("ADMIN_PANEL_TOKEN", "")
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
+CRON_TOKEN = os.getenv("CRON_TOKEN", "Nw8CnNI4dfwWLwGJQuxBt4hI_XAM7W9ZHx1Yk")
 
-# Fixed TP/SL strategy (configurable)
-FIXED_SL_PCT = float(os.getenv("FIXED_SL_PCT", "0.02"))  # 2%
-FIXED_TP_PCT = float(os.getenv("FIXED_TP_PCT", "0.04"))  # 4%
-SHOW_FIXED_SLTP = os.getenv("SHOW_FIXED_SLTP", "true").lower() in ("1","true","yes")
-CRON_TOKEN = os.getenv("CRON_TOKEN", "")  # optional security token for /cron
+SHOW_FIXED_SLTP = os.getenv("SHOW_FIXED_SLTP", "true").lower() == "true"
+FIXED_SL_PCT = float(os.getenv("FIXED_SL_PCT", "0.02"))
+FIXED_TP_PCT = float(os.getenv("FIXED_TP_PCT", "0.04"))
 
-if not (BOT_TOKEN and WEBHOOK_SECRET and TELEGRAM_WEBHOOK_SECRET and DATABASE_URL):
-    raise RuntimeError("Set TELEGRAM_BOT_TOKEN, WEBHOOK_SECRET, TELEGRAM_WEBHOOK_SECRET, DATABASE_URL")
+ALLOWED_SYMBOLS = os.getenv("ALLOWED_SYMBOLS", "BTCUSDT,ETHUSDT,DOGEUSDT,SOLUSDT,BNBUSDT").split(",")
 
-app = FastAPI(title="SourceTrader MVP (FA + Jalali + Daily Summary)")
+# ─────────────────────────────────────────────────────────────
+# App
+# ─────────────────────────────────────────────────────────────
+app = FastAPI(title="SourceTrader")
 
-# ===================== TIME HELPERS =====================
-TEHRAN = ZoneInfo("Asia/Tehran")
-
-def now_dt() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
-
-def to_tehran(dt: datetime.datetime) -> datetime.datetime:
-    if getattr(dt, "tzinfo", None) is None:
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
-    return dt.astimezone(TEHRAN)
-
-def jalali_str(dt: datetime.datetime, with_time: bool = True) -> str:
-    dt_th = to_tehran(dt)
-    j = jdatetime.datetime.fromgregorian(datetime=dt_th)
-    return f"{j.strftime('%Y/%m/%d')} - {dt_th.strftime('%H:%M')}" if with_time else j.strftime('%Y/%m/%d')
-
-def tehran_day_bounds(dt_utc: Optional[datetime.datetime] = None) -> Tuple[datetime.datetime, datetime.datetime, str]:
-    """Return today's Tehran [start_utc, end_utc) and tehran_date_str (YYYY-MM-DD)."""
-    base = to_tehran(dt_utc or now_dt())
-    tehran_date = base.date()
-    start_th = datetime.datetime.combine(tehran_date, datetime.time(0,0), tzinfo=TEHRAN)
-    end_th = start_th + datetime.timedelta(days=1)
-    return start_th.astimezone(datetime.timezone.utc), end_th.astimezone(datetime.timezone.utc), tehran_date.isoformat()
-
-# ===================== DB (Postgres) =====================
-def db_conn():
+# ─────────────────────────────────────────────────────────────
+# DB Helpers
+# ─────────────────────────────────────────────────────────────
+def get_conn():
     return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
-def db_exec(q, args=()):
-    with db_conn() as conn:
+def db_exec(q, args=None):
+    with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(q, args)
-            try:
+            cur.execute(q, args or ())
+            if cur.description:
                 return cur.fetchall()
-            except psycopg2.ProgrammingError:
-                return None
-
-def init_db():
-    # جدول users (همون قبلی شما)
-    db_exec("""
-    CREATE TABLE IF NOT EXISTS users (
-        id BIGINT PRIMARY KEY,
-        expires_at TIMESTAMPTZ,
-        awaiting_tx BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-    )
-    """)
-
-    # جدول signals (حداقل ستون‌های پایه)
-    db_exec("""
-    CREATE TABLE IF NOT EXISTS signals (
-        id SERIAL PRIMARY KEY,
-        symbol TEXT NOT NULL,
-        side TEXT NOT NULL,              -- LONG | SHORT | CLOSE_LONG | CLOSE_SHORT
-        price DOUBLE PRECISION NOT NULL,
-        time TIMESTAMPTZ NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-    )
-    """)
+            return None
 
 def migrate_db():
-    # ستون‌هایی که نسخه‌های جدید کد نیاز دارند:
+    # users
+    db_exec(
+        """CREATE TABLE IF NOT EXISTS users(
+            id BIGINT PRIMARY KEY,
+            expires_at TIMESTAMPTZ,
+            awaiting_tx BOOLEAN DEFAULT FALSE,
+            trial_started_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )"""
+    )
+    # signals
+    db_exec(
+        """CREATE TABLE IF NOT EXISTS signals(
+            id SERIAL PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            price DOUBLE PRECISION NOT NULL,
+            time TIMESTAMPTZ NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )"""
+    )
+    # migrations/additions
     db_exec("ALTER TABLE signals ADD COLUMN IF NOT EXISTS ref_open_id INTEGER")
     db_exec("ALTER TABLE signals ADD COLUMN IF NOT EXISTS pnl_pct DOUBLE PRECISION")
     db_exec("ALTER TABLE signals ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ")
-
-    # ایندکس‌های مفید (اختیاری ولی بهتره):
     db_exec("CREATE INDEX IF NOT EXISTS idx_signals_time ON signals(time)")
     db_exec("CREATE INDEX IF NOT EXISTS idx_signals_ref ON signals(ref_open_id)")
+    db_exec("CREATE INDEX IF NOT EXISTS idx_signals_side ON signals(side)")
+    db_exec("CREATE INDEX IF NOT EXISTS idx_users_expires ON users(expires_at)")
 
+# Run migration on startup
+migrate_db()
 
-    # seed admins
-    now = now_dt()
-    for aid in ADMIN_IDS:
-        try:
-            db_exec("""
-            INSERT INTO users(telegram_id, is_admin, joined_at)
-            VALUES (%s, TRUE, %s)
-            ON CONFLICT (telegram_id) DO UPDATE SET is_admin=EXCLUDED.is_admin;
-            """, (int(aid), now))
-        except Exception:
-            pass
+# ─────────────────────────────────────────────────────────────
+# Time & Jalali Helpers
+# ─────────────────────────────────────────────────────────────
+TZ_TEHRAN = pytz.timezone("Asia/Tehran")
 
-def get_meta(key: str) -> Optional[str]:
-    rows = db_exec("SELECT value FROM meta WHERE key=%s", (key,))
-    return rows[0]["value"] if rows else None
+def now_dt() -> datetime:
+    return datetime.now(timezone.utc)
 
-def set_meta(key: str, value: str):
-    db_exec("""
-    INSERT INTO meta(key,value) VALUES (%s,%s)
-    ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
-    """, (key, value))
+def to_tehran(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(TZ_TEHRAN)
 
-def is_active_user(telegram_id: int) -> bool:
-    rows = db_exec("SELECT subscription_expires_at FROM users WHERE telegram_id=%s", (telegram_id,))
-    if not rows: return False
-    exp = rows[0]["subscription_expires_at"]
-    if not exp: return False
-    if getattr(exp, "tzinfo", None) is None:
-        exp = exp.replace(tzinfo=datetime.timezone.utc)
-    return now_dt() <= exp
+def jalali_date_str(dt: datetime) -> str:
+    t = to_tehran(dt)
+    j = jdatetime.GregorianToJalali(t.year, t.month, t.day).getJalaliList()
+    y, m, d = j
+    hh = str(t.hour).zfill(2)
+    mm = str(t.minute).zfill(2)
+    return f"{y:04d}/{m:02d}/{d:02d} - {hh}:{mm}"
 
-def ensure_trial(telegram_id: int):
-    rows = db_exec("SELECT trial_started_at FROM users WHERE telegram_id=%s", (telegram_id,))
-    if not rows: return
-    if rows[0]["trial_started_at"]: return
-    start = now_dt()
-    exp = start + datetime.timedelta(days=TRIAL_DAYS)
-    db_exec("""
-        UPDATE users SET trial_started_at=%s, subscription_expires_at=%s
-        WHERE telegram_id=%s
-    """, (start, exp, telegram_id))
+def jalali_short(dt: datetime) -> str:
+    t = to_tehran(dt)
+    j = jdatetime.GregorianToJalali(t.year, t.month, t.day).getJalaliList()
+    y, m, d = j
+    return f"{y:04d}/{m:02d}/{d:02d}"
 
-def extend_subscription(telegram_id: int, days: int):
-    rows = db_exec("SELECT subscription_expires_at FROM users WHERE telegram_id=%s", (telegram_id,))
-    base = now_dt()
-    if rows and rows[0]["subscription_expires_at"]:
-        cur_exp = rows[0]["subscription_expires_at"]
-        if cur_exp and cur_exp > base:
-            base = cur_exp
-    new_exp = base + datetime.timedelta(days=days)
-    db_exec("UPDATE users SET subscription_expires_at=%s WHERE telegram_id=%s", (new_exp, telegram_id))
-    return new_exp
+# ─────────────────────────────────────────────────────────────
+# Price Formatter (فارسی + حذف صفر)
+# ─────────────────────────────────────────────────────────────
+def format_price(p: float) -> str:
+    try:
+        p = float(p)
+    except:
+        return str(p)
 
-def list_active_users() -> List[int]:
-    rows = db_exec("SELECT telegram_id, subscription_expires_at FROM users")
-    res = []
-    for r in rows or []:
-        exp = r["subscription_expires_at"]
-        if exp:
-            if getattr(exp, "tzinfo", None) is None:
-                exp = exp.replace(tzinfo=datetime.timezone.utc)
-            if now_dt() <= exp:
-                res.append(int(r["telegram_id"]))
-    return res
-
-def save_signal(symbol: str, side: str, price, t: str) -> int:
-    rows = db_exec("""
-        INSERT INTO signals(symbol, side, price, time, created_at)
-        VALUES (%s,%s,%s,%s,%s) RETURNING id
-    """, (symbol, side, price, t or "", now_dt()))
-    return rows[0]["id"] if rows else 0
-
-def update_signal_ref(sid: int, ref_open_id: Optional[int]):
-    if ref_open_id:
-        db_exec("UPDATE signals SET ref_open_id=%s WHERE id=%s", (ref_open_id, sid))
-
-def find_ref_open_id(symbol: str, close_side: str) -> Optional[int]:
-    s = (close_side or "").upper()
-    open_side = "LONG" if s == "CLOSE_LONG" else "SHORT" if s == "CLOSE_SHORT" else None
-    if not open_side:
-        return None
-    rows = db_exec("""
-        SELECT id FROM signals
-        WHERE symbol=%s AND side=%s
-        ORDER BY id DESC LIMIT 1
-    """, (symbol, open_side))
-    return rows[0]["id"] if rows else None
-
-# ===================== TELEGRAM HELPERS =====================
-# Persian buttons
-BTN_LAST = "📈 آخرین سیگنال‌ها"
-BTN_STATUS = "🔑 وضعیت اشتراک"
-BTN_SUBSCRIBE = "💳 تمدید اشتراک"
-BTN_HELP = "ℹ️ راهنما"
-BTN_SUPPORT = "🆘 پشتیبانی"
-
-MAIN_KB = {
-    "keyboard": [
-        [{"text": BTN_LAST}, {"text": BTN_STATUS}],
-        [{"text": BTN_SUBSCRIBE}, {"text": BTN_HELP}],
-        [{"text": BTN_SUPPORT}]
-    ],
-    "resize_keyboard": True,
-    "is_persistent": True
-}
-
-async def tg_send(chat_id: int, text: str, parse_mode: Optional[str] = "HTML", reply_markup: Optional[dict] = None):
-    async with httpx.AsyncClient(timeout=20) as client:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        data = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
-        if parse_mode: data["parse_mode"] = parse_mode
-        if reply_markup: data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
-        await client.post(url, data=data)
-
-async def tg_send_to_admins(text: str):
-    for aid in ADMIN_IDS:
-        try:
-            await tg_send(int(aid), text)
-        except Exception:
-            pass
-
-def is_cmd(txt: str, *cmds: str) -> bool:
-    t = (txt or "").strip()
-    if not t: return False
-    for c in cmds:
-        if t == c or t.startswith(c + " "):  # allow args
-            return True
-    return False
-
-# === نمایش جهت‌ها ===
-def disp_side(side: str) -> str:
-    s = (side or "").upper()
-    if s == "LONG": return "LONG"
-    if s == "SHORT": return "SHORT"
-    if s == "CLOSE_LONG": return "Close LONG"
-    if s == "CLOSE_SHORT": return "Close SHORT"
-    return side or "N/A"
-
-# === فرمت قیمت (طبق خواسته جدید) ===
-def fmt_price(price) -> str:
-    if not isinstance(price, (int, float)):
-        return "N/A"
-    p = abs(price)
     if p >= 100:
-        out = f"{price:.2f}"
+        fmt = f"{p:.2f}"
     elif p >= 1:
-        out = f"{price:.4f}"
+        fmt = f"{p:.4f}"
     elif p >= 0.1:
-        out = f"{price:.5f}"
+        fmt = f"{p:.5f}"
     else:
-        out = f"{price:.5f}"
-    out = out.rstrip('0').rstrip('.') if '.' in out else out
-    return out
+        fmt = f"{p:.5f}"
 
-def compute_fixed_sl_tp(price: Optional[float], side: str) -> Tuple[Optional[float], Optional[float]]:
-    if not isinstance(price, (int,float)) or price <= 0:
-        return None, None
-    s = (side or "").upper()
-    if s == "LONG":
-        sl = price * (1 - FIXED_SL_PCT)
-        tp = price * (1 + FIXED_TP_PCT)
-    elif s == "SHORT":
-        sl = price * (1 + FIXED_SL_PCT)  # stop above entry
-        tp = price * (1 - FIXED_TP_PCT)
-    else:
-        return None, None
-    return sl, tp
+    # حذف صفرهای انتهایی و نقطه اضافه
+    fmt = fmt.rstrip("0").rstrip(".")
+    return fmt
 
-def signal_disclaimer_in_fa() -> str:
-    return (
+# ─────────────────────────────────────────────────────────────
+# Telegram helpers
+# ─────────────────────────────────────────────────────────────
+def tg_keyboard_default():
+    return {
+        "keyboard": [
+            [{"text": "📊 آمار"}, {"text": "📥 اشتراک"}],
+            [{"text": "🧾 آخرین سیگنال‌ها"}, {"text": "ℹ️ راهنما"}],
+            [{"text": "🆘 پشتیبانی"}],
+        ],
+        "resize_keyboard": True,
+    }
+
+HELP_TEXT = (
+    "ℹ️ راهنما\n\n"
+    "به سورس‌تریدر خوش آمدید!\n"
+    "— سیگنال‌ها به‌صورت خودکار از استراتژی شما ارسال می‌شوند.\n"
+    "— تاریخ‌ها به‌صورت شمسی و زمان بر اساس تهران نمایش داده می‌شود.\n\n"
+    "دستورها:\n"
+    "• /start — شروع و نمایش وضعیت اشتراک\n"
+    "• 📥 اشتراک — دریافت و تأیید اشتراک (دستی)\n"
+    "• 🧾 آخرین سیگنال‌ها — نمایش چند سیگنال آخر\n"
+    "• 📊 آمار — آمار امروز/هفته/ماه (برد/باخت/WinRate/جمعِ سودهای مثبت)\n"
+    "• ℹ️ راهنما — همین صفحه\n"
+    "• 🆘 پشتیبانی — ارتباط با پشتیبانی\n\n"
+    "پشتیبانی: @sourcetrader_support"
+)
+
+RISK_NOTE = (
     "ℹ️ توجه: حد ضرر و تارگت پیشنهادی صرفاً جهت مدیریت ریسک در نظر گرفته شده‌اند.\n"
     "ممکن است ربات قبل از رسیدن به این سطوح، «سیگنال بستن هوشمند» ارسال کند.\n"
     "انتخاب نهایی، مدیریت سرمایه و تصمیم به نگه‌داشتن یا بستن معامله همیشه با شماست."
+)
+
+def tg_send(chat_id: int, text: str, parse_mode: str = "Markdown", reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    # Retry ساده
+    for i in range(3):
+        try:
+            r = httpx.post(f"{TG_API}/sendMessage", json=payload, timeout=10)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+    return None
+
+# ─────────────────────────────────────────────────────────────
+# Users & Subscription helpers
+# ─────────────────────────────────────────────────────────────
+def get_user(uid: int):
+    rows = db_exec("SELECT * FROM users WHERE id=%s", (uid,))
+    return rows[0] if rows else None
+
+def ensure_user(uid: int):
+    u = get_user(uid)
+    if not u:
+        db_exec("INSERT INTO users(id, awaiting_tx, trial_started_at) VALUES(%s, FALSE, NOW())", (uid,))
+    return get_user(uid)
+
+def is_active_user(uid: int) -> bool:
+    row = db_exec("SELECT expires_at FROM users WHERE id=%s", (uid,))
+    if not row:
+        return False
+    exp = row[0]["expires_at"]
+    if not exp:
+        return False
+    return now_dt() <= exp
+
+def activate_trial(uid: int, days: int = TRIAL_DAYS):
+    # اگر قبلاً trial_started_at دارد و expires_at هم دارد، دوباره ست نکن
+    u = ensure_user(uid)
+    if u and u.get("trial_started_at") and u.get("expires_at"):
+        return
+    exp = now_dt() + timedelta(days=days)
+    db_exec(
+        "UPDATE users SET expires_at=%s, trial_started_at=COALESCE(trial_started_at, NOW()) WHERE id=%s",
+        (exp, uid),
     )
 
-def format_signal(title, symbol, side, price, t, sig_id=None, sl=None, tp=None):
-    price_str = fmt_price(price)
-    lines = []
-    lines.append(f"📡 <b>{title}</b>" + (f"  #{sig_id}" if sig_id else ""))
-    lines.append(f"📌 نماد: <b>{symbol}</b>")
-    lines.append(f"🧭 جهت: <b>{disp_side(side)}</b>")
-    lines.append(f"💲 قیمت: <b>{price_str}</b>")
-    lines.append(f"🕒 زمان ارسال: <code>{jalali_str(now_dt(), True)}</code>")
+def set_awaiting_tx(uid: int, val: bool):
+    db_exec("UPDATE users SET awaiting_tx=%s WHERE id=%s", (val, uid))
 
-    # اگر Close نیست و SL/TP از TV نیامده و تنظیم فعال است → محاسبه ثابت
-    if (not str(side).upper().startswith("CLOSE")) and SHOW_FIXED_SLTP and (sl is None and tp is None):
-        sl_c, tp_c = compute_fixed_sl_tp(price, side)
-        if sl_c is not None:
-            lines.append(f"⛔ حد ضرر: <b>{fmt_price(sl_c)}</b>")
-        if tp_c is not None:
-            lines.append(f"🎯 تارگت: <b>{fmt_price(tp_c)}</b>")
-        lines.append(signal_disclaimer_in_fa())
+# ─────────────────────────────────────────────────────────────
+# Signals helpers
+# ─────────────────────────────────────────────────────────────
+def insert_signal(symbol: str, side: str, price: float, t: datetime) -> int:
+    rows = db_exec(
+        "INSERT INTO signals(symbol, side, price, time) VALUES(%s,%s,%s,%s) RETURNING id",
+        (symbol, side, price, t),
+    )
+    return rows[0]["id"]
+
+def update_signal_ref(sid: int, ref_open_id: int):
+    db_exec("UPDATE signals SET ref_open_id=%s WHERE id=%s", (ref_open_id, sid))
+
+def set_signal_closed(close_id: int):
+    db_exec("UPDATE signals SET closed_at=NOW() WHERE id=%s", (close_id,))
+
+def _calc_pnl_pct_for_close(close_row):
+    if not close_row or not close_row.get("ref_open_id"):
+        return None
+    op = db_exec("SELECT id, side, price FROM signals WHERE id=%s", (close_row["ref_open_id"],))
+    if not op:
+        return None
+    open_price = float(op[0]["price"])
+    close_price = float(close_row["price"])
+    side = close_row["side"].upper()
+    if open_price <= 0:
+        return None
+    if side == "CLOSE_LONG":
+        pnl = (close_price - open_price) / open_price * 100.0
+    elif side == "CLOSE_SHORT":
+        pnl = (open_price - close_price) / open_price * 100.0
     else:
-        # اگر TV sl/tp داده بود هم نشان بدهیم
-        if isinstance(sl, (int,float)):
-            lines.append(f"⛔ حد ضرر: <b>{fmt_price(sl)}</b>")
-        if isinstance(tp, (int,float)):
-            lines.append(f"🎯 تارگت: <b>{fmt_price(tp)}</b>")
-        if not str(side).upper().startswith("CLOSE"):
-            lines.append(signal_disclaimer_in_fa())
+        return None
+    return round(pnl, 4)
 
-    return "\n".join(lines)
+def backfill_missing_pnl():
+    rows = db_exec(
+        """
+        SELECT id, side, price, ref_open_id
+        FROM signals
+        WHERE (side='CLOSE_LONG' OR side='CLOSE_SHORT')
+          AND pnl_pct IS NULL
+          AND ref_open_id IS NOT NULL
+        """
+    )
+    updated = 0
+    if not rows:
+        return 0
+    for r in rows:
+        pnl = _calc_pnl_pct_for_close(r)
+        if pnl is not None:
+            db_exec("UPDATE signals SET pnl_pct=%s WHERE id=%s", (pnl, r["id"]))
+            updated += 1
+    return updated
 
-def extract_txid(text: str) -> Optional[str]:
-    if not text: return None
-    text = text.strip()
-    m = re.search(r'(0x)?[A-Fa-f0-9]{32,}', text)
-    return m.group(0) if m else None
+# ─────────────────────────────────────────────────────────────
+# Stats helpers
+# ─────────────────────────────────────────────────────────────
+def _stats_since_days(days: int):
+    days = max(1, min(int(days), 90))
+    q = f"""
+    WITH c AS (
+      SELECT pnl_pct
+      FROM signals
+      WHERE (side='CLOSE_LONG' OR side='CLOSE_SHORT')
+        AND pnl_pct IS NOT NULL
+        AND closed_at >= NOW() - INTERVAL '{days} days'
+    )
+    SELECT
+      COUNT(*)                                         AS total,
+      COUNT(*) FILTER (WHERE pnl_pct > 0)              AS wins,
+      COUNT(*) FILTER (WHERE pnl_pct <= 0)             AS losses,
+      COALESCE(AVG(CASE WHEN pnl_pct > 0 THEN 1.0 ELSE 0.0 END) * 100, 0) AS winrate,
+      COALESCE(SUM(CASE WHEN pnl_pct > 0 THEN pnl_pct ELSE 0 END), 0)     AS sum_profit_pos
+    FROM c;
+    """
+    rows = db_exec(q)
+    if not rows:
+        return {"total": 0, "wins": 0, "losses": 0, "winrate": 0.0, "sum_profit_pos": 0.0}
+    r = rows[0]
+    return {
+        "total": int(r["total"] or 0),
+        "wins": int(r["wins"] or 0),
+        "losses": int(r["losses"] or 0),
+        "winrate": round(float(r["winrate"] or 0.0), 1),
+        "sum_profit_pos": round(float(r["sum_profit_pos"] or 0.0), 2),
+    }
 
-# ===================== MODELS =====================
+def _bar(winrate: float) -> str:
+    winrate = max(0.0, min(100.0, winrate))
+    blocks = 10
+    filled = int(round(winrate / 10.0))
+    return "█" * filled + "░" * (blocks - filled)
+
+def format_stats_message():
+    try:
+        backfill_missing_pnl()
+    except Exception:
+        pass
+
+    d1 = _stats_since_days(1)
+    d7 = _stats_since_days(7)
+    d30 = _stats_since_days(30)
+
+    def block(title, d):
+        return (
+            f"• {title}:\n"
+            f"  ├─ معاملات: {d['total']}\n"
+            f"  ├─ برد: {d['wins']}  |  باخت: {d['losses']}\n"
+            f"  ├─ WinRate: {d['winrate']}٪  { _bar(d['winrate']) }\n"
+            f"  └─ جمعِ سودهای مثبت: +{d['sum_profit_pos']}٪\n"
+        )
+
+    msg = (
+        "📊 *آمار عملکرد سیگنال‌ها*\n"
+        "نتایج بر اساس معاملات «بسته‌شده» محاسبه شده‌اند.\n\n"
+        + block("امروز", d1) + "\n"
+        + block("هفته اخیر", d7) + "\n"
+        + block("ماه اخیر", d30) + "\n"
+        "ℹ️ نکته: مجموع سود فقط جمع «سودهای مثبت» است و زیان‌ها در این جمع لحاظ نشده‌اند."
+    )
+    return msg
+
+# ─────────────────────────────────────────────────────────────
+# Message builders (سیگنال‌ها)
+# ─────────────────────────────────────────────────────────────
+def side_fa(side_en: str) -> str:
+    s = side_en.upper()
+    if s == "LONG":
+        return "Long"
+    if s == "SHORT":
+        return "Short"
+    if s == "CLOSE_LONG":
+        return "Close Long"
+    if s == "CLOSE_SHORT":
+        return "Close Short"
+    return s
+
+def format_signal_message(symbol: str, side: str, price: float, t: datetime, with_sltp=True):
+    dt_str = jalali_date_str(t)
+    p_str = format_price(price)
+    title_icon = "🟢" if side.upper() == "LONG" else "🔴" if side.upper() == "SHORT" else "⚪️"
+    sfa = side_fa(side)
+
+    msg = (
+        f"{title_icon} *سیگنال جدید*\n"
+        f"نماد: `{symbol}`\n"
+        f"جهت: *{sfa}*\n"
+        f"قیمت: *{p_str}*\n"
+        f"زمان: `{dt_str}`\n"
+    )
+
+    if with_sltp and SHOW_FIXED_SLTP and side.upper() in ("LONG", "SHORT"):
+        if side.upper() == "LONG":
+            sl = price * (1 - FIXED_SL_PCT)
+            tp = price * (1 + FIXED_TP_PCT)
+        else:
+            sl = price * (1 + FIXED_SL_PCT)
+            tp = price * (1 - FIXED_TP_PCT)
+        msg += f"\nحد ضرر: `{format_price(sl)}`\n"
+        msg += f"تارگت: `{format_price(tp)}`\n"
+
+    msg += f"\n{RISK_NOTE}"
+    return msg
+
+# ─────────────────────────────────────────────────────────────
+# FastAPI models
+# ─────────────────────────────────────────────────────────────
 class TVPayload(BaseModel):
-    strategy: Optional[str] = None
-    symbol:   Optional[str] = None
-    side:     Optional[str] = None   # LONG/SHORT/CLOSE_LONG/CLOSE_SHORT
-    price:    Optional[float] = None
-    time:     Optional[str] = None
-    secret:   Optional[str] = None
-    sl:       Optional[float] = None
-    tp:       Optional[float] = None
-    tf:       Optional[str] = None
+    strategy: str | None = None
+    symbol: str
+    side: str
+    price: float
+    time: str
+    secret: str | None = None
+    ref: int | None = None     # شناسه مرجع برای کلوز
+    ref_open_id: int | None = None
 
-# ===================== STARTUP =====================
-init_db()
-migrate_db()
-# ===================== ROUTES =====================
-# Health: GET + HEAD
+# ─────────────────────────────────────────────────────────────
+# Routes: Health
+# ─────────────────────────────────────────────────────────────
 @app.get("/health")
 def health_get():
     return {"status": "ok"}
@@ -338,378 +412,257 @@ def health_get():
 def health_head():
     return PlainTextResponse("", status_code=200)
 
-# Daily summary cron hook (call every 5min via UptimeRobot)
-@app.get("/cron")
-def cron(token: Optional[str] = Query(default=None)):
-    if CRON_TOKEN and token != CRON_TOKEN:
-        raise HTTPException(status_code=401, detail="invalid token")
-    # only at/after 23:30 Tehran and only once per day
-    now = now_dt()
-    now_th = to_tehran(now)
-    if now_th.hour < 23 or (now_th.hour == 23 and now_th.minute < 30):
-        return {"ok": True, "skipped": "too_early"}
-    # check last sent
-    _, _, tehran_date_str = tehran_day_bounds(now)
-    last_sent = get_meta("last_summary_tehran_date")
-    if last_sent == tehran_date_str:
-        return {"ok": True, "skipped": "already_sent"}
+# ─────────────────────────────────────────────────────────────
+# Routes: Telegram Webhook
+# ─────────────────────────────────────────────────────────────
+@app.post("/tg/webhook")
+async def tg_webhook(request: Request, x_telegram_bot_api_secret_token: str | None = Header(default=None)):
+    # Optional: telegram secret token check
+    if TG_WEBHOOK_SECRET and x_telegram_bot_api_secret_token != TG_WEBHOOK_SECRET:
+        return JSONResponse({"detail": "forbidden"}, status_code=403)
 
-    # compute summary for "today" Tehran
-    start_utc, end_utc, _ = tehran_day_bounds(now)
-    summary_text = build_daily_summary(start_utc, end_utc, now_th)
-    users = list_active_users()
-    for uid in users:
+    data = await request.json()
+    msg = data.get("message") or data.get("edited_message")
+    if not msg:
+        return {"ok": True}
+
+    chat = msg.get("chat", {})
+    chat_id = chat.get("id")
+    user_id = msg.get("from", {}).get("id")
+    text = (msg.get("text") or "").strip()
+
+    # Ensure user exists
+    ensure_user(user_id)
+
+    # Map Persian buttons to commands
+    txt = text
+    if txt in ("ℹ️ راهنما", "/help"):
+        tg_send(chat_id, HELP_TEXT, reply_markup=tg_keyboard_default())
+        return {"ok": True}
+
+    if txt in ("🆘 پشتیبانی",):
+        tg_send(chat_id, "برای پشتیبانی و سوالات: @sourcetrader_support", reply_markup=tg_keyboard_default())
+        return {"ok": True}
+
+    if txt in ("📊 آمار", "/stats"):
         try:
-            # broadcast in Persian
-            import asyncio
-            asyncio.run(tg_send(uid, summary_text))
+            msg_stats = format_stats_message()
         except Exception:
-            pass
-    set_meta("last_summary_tehran_date", tehran_date_str)
-    return {"ok": True, "sent_to": len(users)}
+            msg_stats = "❗️ خطا در محاسبه‌ی آمار. بعداً دوباره تلاش کنید."
+        tg_send(chat_id, msg_stats, reply_markup=tg_keyboard_default())
+        return {"ok": True}
 
+    if txt in ("🧾 آخرین سیگنال‌ها", "/last"):
+        rows = db_exec("SELECT symbol, side, price, time FROM signals ORDER BY id DESC LIMIT 5")
+        if not rows:
+            tg_send(chat_id, "فعلاً سیگنالی ثبت نشده.", reply_markup=tg_keyboard_default())
+            return {"ok": True}
+        lines = ["🧾 آخرین سیگنال‌ها:"]
+        for r in rows:
+            lines.append(
+                f"- {r['symbol']} | {side_fa(r['side'])} | {format_price(r['price'])} | {jalali_date_str(r['time'])}"
+            )
+        tg_send(chat_id, "\n".join(lines), reply_markup=tg_keyboard_default())
+        return {"ok": True}
 
-@app.head("/cron")
-def cron_head(token: Optional[str] = Query(default=None)):
-    if CRON_TOKEN and token != CRON_TOKEN:
-        return PlainTextResponse("", status_code=401)
-    # HEAD فقط چک سلامت؛ اجرای گزارش روزانه اینجا انجام نمی‌شود
-    return PlainTextResponse("", status_code=200)
+    if txt in ("📥 اشتراک", "/subscribe"):
+        set_awaiting_tx(user_id, True)
+        tg_send(
+            chat_id,
+            "برای فعال‌سازی اشتراک، هش/لینک تراکنش کریپتو را همینجا ارسال کنید.\n"
+            "پس از بررسی، اشتراک شما فعال می‌شود.",
+            reply_markup=tg_keyboard_default(),
+        )
+        return {"ok": True}
 
+    if txt == "/start":
+        # فعال‌سازی تست اگر قبلاً نداشته
+        activate_trial(user_id, TRIAL_DAYS)
+        u = get_user(user_id)
+        exp = u.get("expires_at")
+        active = "✅ فعال" if is_active_user(user_id) else "⛔️ غیرفعال"
+        exp_str = jalali_short(exp) if exp else "—"
+        tg_send(
+            chat_id,
+            f"خوش آمدید 👋\nوضعیت اشتراک: {active}\nتاریخ انقضا: {exp_str}",
+            reply_markup=tg_keyboard_default(),
+        )
+        return {"ok": True}
 
-def build_daily_summary(start_utc: datetime.datetime, end_utc: datetime.datetime, now_th: datetime.datetime) -> str:
-    # تعداد سیگنال‌ها (Open های امروز)
-    opens = db_exec("""
-        SELECT id, symbol, side, price, created_at
-        FROM signals
-        WHERE created_at >= %s AND created_at < %s
-          AND side IN ('LONG','SHORT')
-        ORDER BY id ASC
-    """, (start_utc, end_utc)) or []
+    # اگر در حالت انتظار TX هست:
+    u = get_user(user_id)
+    if u and u.get("awaiting_tx"):
+        # هر متنی را به عنوان TXID می‌پذیریم و اشتراک را ۳۰ روز تمدید می‌کنیم
+        db_exec("UPDATE users SET awaiting_tx=FALSE WHERE id=%s", (user_id,))
+        new_exp = now_dt() + timedelta(days=30)
+        db_exec("UPDATE users SET expires_at=%s WHERE id=%s", (new_exp, user_id))
+        tg_send(
+            chat_id,
+            f"✅ پرداخت دریافت شد و اشتراک تا {jalali_short(new_exp)} فعال شد.",
+            reply_markup=tg_keyboard_default(),
+        )
+        return {"ok": True}
 
-    # کلوزهایی که امروز اتفاق افتاد (برای محاسبه سود/زیان)
-    closes = db_exec("""
-        SELECT id, symbol, side, price, ref_open_id, created_at
-        FROM signals
-        WHERE created_at >= %s AND created_at < %s
-          AND side IN ('CLOSE_LONG','CLOSE_SHORT')
-          AND ref_open_id IS NOT NULL
-        ORDER BY id ASC
-    """, (start_utc, end_utc)) or []
+    # اندازه‌گیری وضعیت
+    if txt == "/status":
+        u = get_user(user_id)
+        exp = u.get("expires_at")
+        active = "✅ فعال" if is_active_user(user_id) else "⛔️ غیرفعال"
+        exp_str = jalali_short(exp) if exp else "—"
+        tg_send(chat_id, f"وضعیت اشتراک: {active}\nتاریخ انقضا: {exp_str}", reply_markup=tg_keyboard_default())
+        return {"ok": True}
 
-    wins = 0
-    losses = 0
-    total_pnl = 0.0
-    best_pnl = None
-    best_sig = None
+    # پیش‌فرض: راهنما
+    tg_send(chat_id, HELP_TEXT, reply_markup=tg_keyboard_default())
+    return {"ok": True}
 
-    for c in closes:
-        ref_id = c["ref_open_id"]
-        op = db_exec("SELECT id, symbol, side, price, created_at FROM signals WHERE id=%s", (ref_id,))
-        if not op: 
-            continue
-        o = op[0]
-        open_side = o["side"].upper()
-        open_price = o["price"]
-        close_price = c["price"]
-        if not isinstance(open_price, (int,float)) or not isinstance(close_price, (int,float)) or open_price <= 0:
-            continue
-        if c["side"].upper() == "CLOSE_LONG" and open_side == "LONG":
-            pnl = (close_price - open_price) / open_price
-        elif c["side"].upper() == "CLOSE_SHORT" and open_side == "SHORT":
-            pnl = (open_price - close_price) / open_price
-        else:
-            continue
-
-        total_pnl += pnl
-        if pnl > 0: wins += 1
-        elif pnl < 0: losses += 1
-
-        if (best_pnl is None) or (pnl > best_pnl):
-            best_pnl = pnl
-            best_sig = {"symbol": o["symbol"], "pnl": pnl, "open_id": o["id"], "close_id": c["id"]}
-
-    total_trades = wins + losses
-    winrate = (wins / total_trades * 100.0) if total_trades > 0 else None
-
-    def pct(x):
-        return f"{x*100:.2f}%" if x is not None else "N/A"
-
-    title = f"🗓 گزارش روزانه سیگنال‌ها - {now_th.strftime('%Y/%m/%d')} (تهران)"
-    lines = [title, ""]
-    lines.append(f"• تعداد سیگنال‌های امروز (ورود): {len(opens)}")
-    lines.append(f"• تعداد معاملات بسته‌شده امروز: {total_trades}")
-    lines.append(f"• درصد موفقیت (WinRate): {f'{winrate:.1f}%' if winrate is not None else 'N/A'}")
-    if best_sig:
-        lines.append(f"• بهترین سیگنال: {best_sig['symbol']}  ({pct(best_sig['pnl'])})  #{best_sig['open_id']}→#{best_sig['close_id']}")
-    else:
-        lines.append("• بهترین سیگنال: N/A")
-    lines.append(f"• سود تجمعی اگر همه اجرا می‌شد: {pct(total_pnl)}")
-    lines.append("\n⚠️ این آمار صرفاً اطلاع‌رسانی است و توصیه سرمایه‌گذاری محسوب نمی‌شود.")
-    return "\n".join(lines)
-
-# TradingView webhook
+# ─────────────────────────────────────────────────────────────
+# Routes: TradingView webhook
+# ─────────────────────────────────────────────────────────────
 @app.post("/tv")
 async def tv_hook(payload: TVPayload):
-    if payload.secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="invalid secret")
+    try:
+        if WEBHOOK_SECRET and payload.secret != WEBHOOK_SECRET:
+            return JSONResponse({"detail": "invalid secret"}, status_code=403)
 
-    title  = payload.strategy or "Signal"
-    symbol = payload.symbol or "UNKNOWN"
-    side   = (payload.side or "N/A").upper()
+        symbol = payload.symbol.upper()
+        side = payload.side.upper()
+        price = float(payload.price)
+        t = datetime.fromisoformat(payload.time.replace("Z", "+00:00"))
 
-    # save & get ID
-    sid = save_signal(symbol, side, payload.price, payload.time)
+        if symbol not in ALLOWED_SYMBOLS:
+            return {"ok": True, "ignored": "symbol not allowed"}
 
-    # Close → reference last Open and persist ref
-    if side in ("CLOSE_LONG", "CLOSE_SHORT"):
-        ref = find_ref_open_id(symbol, side)
-        if ref:
-            update_signal_ref(sid, ref)
-            title = f"{title} (بستن #{ref})"
+        # ثبت سیگنال
+        sid = insert_signal(symbol, side, price, t)
 
-    text = format_signal(
-        title=title,
-        symbol=symbol,
-        side=side,
-        price=payload.price,
-        t=payload.time,
-        sig_id=None if side.startswith("CLOSE") else sid,  # code only on Open
-        sl=payload.sl,
-        tp=payload.tp,
+        # اگر CLOSE_* است، مرجع را داشته باشیم + بسته شدن را ست کنیم + pnl
+        if side in ("CLOSE_LONG", "CLOSE_SHORT"):
+            if payload.ref_open_id:
+                update_signal_ref(sid, payload.ref_open_id)
+            set_signal_closed(sid)
+            # محاسبه‌ی PnL
+            row = {"id": sid, "side": side, "price": price, "ref_open_id": payload.ref_open_id}
+            pnl = _calc_pnl_pct_for_close(row)
+            if pnl is not None:
+                db_exec("UPDATE signals SET pnl_pct=%s WHERE id=%s", (pnl, sid))
+
+        # ارسال پیام برای همه‌ی کاربران فعال
+        users = db_exec("SELECT id FROM users WHERE expires_at IS NOT NULL AND expires_at >= NOW()")
+        msg = format_signal_message(symbol, side, price, t, with_sltp=True)
+        for u in users or []:
+            tg_send(u["id"], msg, reply_markup=tg_keyboard_default())
+
+        # اگر سیگنال باز (LONG/SHORT) بود و یک ref از طرف TV آوردی، آن ref را روی رکورد باز تنظیم کن
+        if side in ("LONG", "SHORT") and payload.ref is not None:
+            update_signal_ref(sid, payload.ref)
+
+        return {"ok": True, "id": sid}
+    except Exception as e:
+        print("TV ERROR:", e, traceback.format_exc())
+        return JSONResponse({"detail": "server error"}, status_code=500)
+
+# ─────────────────────────────────────────────────────────────
+# Admin (ساده)
+# ─────────────────────────────────────────────────────────────
+@app.get("/admin")
+def admin_home(token: str = Query(default="")):
+    if token != ADMIN_PANEL_TOKEN:
+        return HTMLResponse("<h3>Forbidden</h3>", status_code=403)
+
+    sigs = db_exec(
+        "SELECT id, symbol, side, price, time, created_at, ref_open_id, pnl_pct, closed_at "
+        "FROM signals ORDER BY id DESC LIMIT 50"
     )
-
-    users = list_active_users()
-    async with httpx.AsyncClient(timeout=20) as client:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        for uid in users:
-            try:
-                await client.post(url, data={
-                    "chat_id": uid,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True
-                })
-            except Exception:
-                pass
-    return {"ok": True, "id": sid, "delivered_to": len(users)}
-
-# Telegram webhook
-@app.post("/tg/webhook")
-async def tg_webhook(req: Request):
-    sec = req.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if sec != TELEGRAM_WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="invalid telegram secret")
-
-    update = await req.json()
-    message = update.get("message") or update.get("edited_message") or {}
-    chat = message.get("chat") or {}
-    text = (message.get("text") or "").strip()
-    from_user = message.get("from") or {}
-    chat_id = chat.get("id"); uid = from_user.get("id")
-    username = from_user.get("username"); first = from_user.get("first_name"); last = from_user.get("last_name")
-    if not chat_id or not uid: return {"ok": True}
-
-    # register/update user
-    db_exec("""
-    INSERT INTO users(telegram_id, username, first_name, last_name, joined_at)
-    VALUES (%s,%s,%s,%s,%s)
-    ON CONFLICT (telegram_id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name
-    """, (uid, username, first, last, now_dt()))
-
-    # Commands or Persian buttons
-    t = text
-    is_last      = is_cmd(t, "/last")      or t == BTN_LAST
-    is_status    = is_cmd(t, "/status")    or t == BTN_STATUS
-    is_subscribe = is_cmd(t, "/subscribe") or t == BTN_SUBSCRIBE
-    is_help      = is_cmd(t, "/help")      or t == BTN_HELP
-    is_support   = is_cmd(t, "/support")   or t == BTN_SUPPORT
-    is_menu      = is_cmd(t, "/menu")
-
-    if is_cmd(t, "/start"):
-        ensure_trial(uid)
-        row = db_exec("SELECT subscription_expires_at FROM users WHERE telegram_id=%s", (uid,))
-        exp = row[0]["subscription_expires_at"] if row else None
-        exp_txt = jalali_str(exp, with_time=True) if exp else "N/A"
-        msg = (
-            "👋 به ربات سیگنال SourceTrader خوش آمدید!\n\n"
-            f"✅ {TRIAL_DAYS} روز اشتراک رایگان برای تست فعال شد.\n"
-            f"⏰ انقضا: <b>{exp_txt}</b>\n\n"
-            "از دکمه‌های زیر استفاده کنید:"
-        )
-        await tg_send(chat_id, msg, reply_markup=MAIN_KB); return {"ok": True}
-
-    if is_menu:
-        await tg_send(chat_id, "منوی دستورات:", reply_markup=MAIN_KB); return {"ok": True}
-
-    if is_help:
-        msg = (
-            "ℹ️ <b>راهنمای استفاده از ربات SourceTrader</b>\n\n"
-            "📈 <b>آخرین سیگنال‌ها</b>: مشاهده ۵ سیگنال اخیر بازار.\n"
-            "🔑 <b>وضعیت اشتراک</b>: بررسی فعال/غیرفعال بودن اشتراک و تاریخ انقضا.\n"
-            "💳 <b>تمدید اشتراک</b>: راهنمای پرداخت و ثبت درخواست تمدید.\n"
-            "🆘 <b>پشتیبانی</b>: در صورت هرگونه سوال یا مشکل:\n"
-            "<b>@sourcetrader_support</b>\n\n"
-            "⚠️ توجه: سیگنال‌ها صرفاً آموزشی هستند. مسئولیت تصمیم‌گیری، مدیریت ریسک و سرمایه با کاربر است."
-        )
-        await tg_send(chat_id, msg, reply_markup=MAIN_KB); return {"ok": True}
-
-    if is_support:
-        await tg_send(chat_id, "🆘 برای سوالات و پشتیبانی پیام دهید:\n@sourcetrader_support", reply_markup=MAIN_KB); return {"ok": True}
-
-    if is_status:
-        row = db_exec("SELECT subscription_expires_at FROM users WHERE telegram_id=%s", (uid,))
-        exp = row[0]["subscription_expires_at"] if row else None
-        active = "✅ فعال" if is_active_user(uid) else "⛔️ غیرفعال"
-        exp_txt = jalali_str(exp, with_time=True) if exp else "N/A"
-        await tg_send(chat_id, f"🔑 وضعیت اشتراک: {active}\n⏰ انقضا: <b>{exp_txt}</b>", reply_markup=MAIN_KB); return {"ok": True}
-
-    if is_last:
-        rows = db_exec("SELECT id, symbol, side, price, time, created_at FROM signals ORDER BY id DESC LIMIT 5")
-        if not rows:
-            await tg_send(chat_id, "هنوز سیگنالی ثبت نشده.", reply_markup=MAIN_KB); return {"ok": True}
-        lines = []
-        for r in rows:
-            created = r["created_at"]
-            created_text = jalali_str(created, with_time=True) if created else "-"
-            price_txt = fmt_price(r["price"])
-            lines.append(f"• #{r['id']}  {r['symbol']} | {disp_side(r['side'])} | {price_txt} | {created_text}")
-        await tg_send(chat_id, "📈 آخرین سیگنال‌ها:\n" + "\n".join(lines), reply_markup=MAIN_KB); return {"ok": True}
-
-    if is_subscribe:
-        db_exec("UPDATE users SET awaiting_tx=TRUE WHERE telegram_id=%s", (uid,))
-        msg = (
-            "💳 <b>تمدید اشتراک</b>\n\n"
-            f"1) مبلغ را به آدرس زیر ارسال کنید:\n"
-            f"   • آدرس: <code>{PAYMENT_ADDRESS}</code>\n"
-            f"   • شبکه: <b>{PAYMENT_NETWORK}</b>\n"
-            "2) پس از پرداخت، همین‌جا «هش تراکنش یا لینک اکسپلورر» را ارسال کنید (بدون فرمت خاص).\n"
-            "3) پس از بررسی، اشتراک شما تمدید می‌شود. ✅"
-        )
-        buttons = {
-            "inline_keyboard": [
-                [{"text": "📋 کپی آدرس", "switch_inline_query_current_chat": PAYMENT_ADDRESS}],
-                [{"text": "🧭 Tronscan", "url": "https://tronscan.org/"}]
-            ]
-        }
-        await tg_send(chat_id, msg, reply_markup=buttons); return {"ok": True}
-
-    if is_cmd(t, "/tx"):
-        parts = t.split()
-        if len(parts) < 2:
-            await tg_send(chat_id, "TXID نامعتبر. مثال:\n/tx f1a2b3c4...", reply_markup=MAIN_KB); return {"ok": True}
-        txid = parts[1].strip()
-        db_exec("INSERT INTO payments(telegram_id, txid, status, created_at) VALUES (%s,%s,'pending',%s)", (uid, txid, now_dt()))
-        db_exec("UPDATE users SET awaiting_tx=FALSE WHERE telegram_id=%s", (uid,))
-        await tg_send(chat_id, "✅ درخواست تمدید ثبت شد. پس از تأیید، اشتراک تمدید می‌شود.", reply_markup=MAIN_KB)
-        await tg_send_to_admins(f"🧾 پرداخت جدید:\nUser: {uid}\nTXID: {txid}\nتایید: /confirm {uid} 30"); return {"ok": True}
-
-    # Admin: debug
-    if is_cmd(t, "/debug"):
-        if str(uid) not in ADMIN_IDS:
-            await tg_send(chat_id, "⛔️ فقط ادمین.", reply_markup=MAIN_KB); return {"ok": True}
-        row = db_exec("SELECT trial_started_at, subscription_expires_at, awaiting_tx FROM users WHERE telegram_id=%s", (uid,))
-        ts, exp, aw = (row[0]["trial_started_at"], row[0]["subscription_expires_at"], row[0]["awaiting_tx"]) if row else (None,None,None)
-        def dt_line(name, dtv):
-            if not dtv: return f"{name}: N/A"
-            if getattr(dtv, 'tzinfo', None) is None: dtv = dtv.replace(tzinfo=datetime.timezone.utc)
-            return f"{name}: UTC={dtv.isoformat()} | Tehran/Jalali={jalali_str(dtv, True)}"
-        msg = (
-            "🛠 DEBUG\n"
-            f"TRIAL_DAYS={TRIAL_DAYS}\n"
-            f"{dt_line('now', now_dt())}\n"
-            f"{dt_line('trial_started_at', ts)}\n"
-            f"{dt_line('subscription_expires_at', exp)}\n"
-            f"awaiting_tx={aw}"
-        )
-        await tg_send(chat_id, f"<code>{msg}</code>", reply_markup=MAIN_KB); return {"ok": True}
-
-    # Admin: تایید پرداخت و تمدید
-    if is_cmd(t, "/confirm"):
-        if str(uid) not in ADMIN_IDS:
-            await tg_send(chat_id, "⛔️ فقط ادمین.", reply_markup=MAIN_KB); return {"ok": True}
-        parts = t.split()
-        if len(parts) < 3:
-            await tg_send(chat_id, "استفاده:\n/confirm <user_id> <days>", reply_markup=MAIN_KB); return {"ok": True}
-        try:
-            target, days = int(parts[1]), int(parts[2])
-            new_exp = extend_subscription(target, days)
-            db_exec("UPDATE payments SET status='approved' WHERE telegram_id=%s AND status='pending'", (target,))
-            await tg_send(chat_id, f"✅ تمدید شد تا: <b>{jalali_str(new_exp, with_time=True)}</b>", reply_markup=MAIN_KB)
-            await tg_send(target, f"🎉 اشتراک شما تمدید شد تا: <b>{jalali_str(new_exp, with_time=True)}</b>")
-        except Exception as e:
-            await tg_send(chat_id, f"خطا در تایید: {e}", reply_markup=MAIN_KB)
-        return {"ok": True}
-
-    if is_cmd(t, "/broadcast"):
-        if str(uid) not in ADMIN_IDS:
-            await tg_send(chat_id, "⛔️ فقط ادمین.", reply_markup=MAIN_KB); return {"ok": True}
-        msg = t.replace("/broadcast", "", 1).strip()
-        if not msg:
-            await tg_send(chat_id, "متن خالی است.", reply_markup=MAIN_KB); return {"ok": True}
-        rows = db_exec("SELECT telegram_id FROM users", ())
-        for r in rows or []:
-            try: await tg_send(int(r["telegram_id"]), f"📢 {msg}")
-            except: pass
-        await tg_send(chat_id, "✅ ارسال شد.", reply_markup=MAIN_KB); return {"ok": True}
-
-    # متن آزاد: اگر کاربر در حالت انتظار TX باشد، پرداخت را ثبت کن
-    row = db_exec("SELECT awaiting_tx FROM users WHERE telegram_id=%s", (uid,))
-    if row and row[0]["awaiting_tx"]:
-        tx = extract_txid(t) or t
-        db_exec("INSERT INTO payments(telegram_id, txid, status, created_at) VALUES (%s,%s,'pending',%s)", (uid, tx, now_dt()))
-        db_exec("UPDATE users SET awaiting_tx=FALSE WHERE telegram_id=%s", (uid,))
-        await tg_send(chat_id, "✅ درخواست تمدید ثبت شد. پس از تأیید، اشتراک شما تمدید می‌شود.", reply_markup=MAIN_KB)
-        await tg_send_to_admins(f"🧾 پرداخت جدید:\nUser: {uid}\nTXID: {tx}\nتایید: /confirm {uid} 30")
-        return {"ok": True}
-
-    # اگر شبیه TXID بود، ثبت کن
-    tx_guess = extract_txid(t)
-    if tx_guess:
-        db_exec("INSERT INTO payments(telegram_id, txid, status, created_at) VALUES (%s,%s,'pending',%s)", (uid, tx_guess, now_dt()))
-        await tg_send(chat_id, "✅ درخواست تمدید ثبت شد. پس از تأیید، اشتراک شما تمدید می‌شود.", reply_markup=MAIN_KB)
-        await tg_send_to_admins(f"🧾 پرداخت جدید:\nUser: {uid}\nTXID: {tx_guess}\nتایید: /confirm {uid} 30")
-        return {"ok": True}
-
-    # پیش‌فرض
-    await tg_send(chat_id, "منوی دستورات:", reply_markup=MAIN_KB); return {"ok": True}
-
-# ===================== SIMPLE ADMIN PANEL =====================
-@app.get("/admin", response_class=HTMLResponse)
-def admin_home(token: str):
-    if not ADMIN_PANEL_TOKEN or token != ADMIN_PANEL_TOKEN:
-        return HTMLResponse("<h3>Unauthorized</h3>", status_code=401)
-    users = db_exec("SELECT telegram_id, username, subscription_expires_at, is_admin, joined_at, awaiting_tx FROM users ORDER BY subscription_expires_at DESC NULLS LAST")
-    pays  = db_exec("SELECT id, telegram_id, txid, status, created_at FROM payments ORDER BY id DESC LIMIT 50")
-    sigs  = db_exec("SELECT id, symbol, side, price, time, created_at, ref_open_id FROM signals ORDER BY id DESC LIMIT 50")
-
-    def row(tds): return "<tr>" + "".join([f"<td>{td}</td>" for td in tds]) + "</tr>"
-
-    html = ["<html><head><meta charset='utf-8'><title>Admin</title>"
-            "<style>table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:6px;font-family:Arial;font-size:13px}</style>"
-            "</head><body>"]
-    html.append("<h2>Admin Panel</h2>")
-
-    html.append("<h3>Users</h3><table><tr><th>ID</th><th>Username</th><th>Joined</th><th>Expires</th><th>Admin</th><th>Awaiting TX</th></tr>")
-    for u in users or []:
-        joined = u.get('joined_at'); exp = u.get('subscription_expires_at')
-        joined_txt = jalali_str(joined, True) if joined else "-"
-        exp_txt = jalali_str(exp, True) if exp else "-"
-        html.append(row([u['telegram_id'], u.get('username',''), joined_txt, exp_txt, "✅" if u.get('is_admin') else "—", "⏳" if u.get('awaiting_tx') else "—"]))
-    html.append("</table>")
-
-    html.append("<h3>Payments (last 50)</h3><table><tr><th>ID</th><th>User</th><th>TXID</th><th>Status</th><th>Created</th></tr>")
-    for p in pays or []:
-        created_txt = jalali_str(p['created_at'], True) if p.get('created_at') else "-"
-        html.append(row([p['id'], p['telegram_id'], p['txid'], p['status'], created_txt]))
-    html.append("</table>")
-
-    html.append("<h3>Signals (last 50)</h3><table><tr><th>ID</th><th>Symbol</th><th>Side</th><th>Price</th><th>Created</th><th>Ref Open</th></tr>")
+    rows = []
     for s in sigs or []:
-        created_txt = jalali_str(s['created_at'], True) if s.get('created_at') else "-"
-        price_txt = fmt_price(s.get('price'))
-        html.append(row([s['id'], s['symbol'], disp_side(s['side']), price_txt, created_txt, s.get('ref_open_id') or "—"]))
-    html.append("</table>")
+        rows.append(
+            f"<tr>"
+            f"<td>{s['id']}</td>"
+            f"<td>{s['symbol']}</td>"
+            f"<td>{s['side']}</td>"
+            f"<td>{format_price(s['price'])}</td>"
+            f"<td>{jalali_date_str(s['time'])}</td>"
+            f"<td>{s.get('ref_open_id') or ''}</td>"
+            f"<td>{'' if s.get('pnl_pct') is None else round(s['pnl_pct'], 2)}</td>"
+            f"<td>{'' if not s.get('closed_at') else jalali_date_str(s['closed_at'])}</td>"
+            f"</tr>"
+        )
+    html = f"""
+    <html><head><meta charset="utf-8"><title>Admin</title>
+    <style>
+    body {{font-family: Vazirmatn, sans-serif; padding:20px;}}
+    table {{border-collapse: collapse; width:100%;}}
+    td,th {{border:1px solid #ccc; padding:6px; font-size:14px; text-align:center}}
+    </style>
+    </head><body>
+    <h2>آخرین سیگنال‌ها</h2>
+    <table>
+      <tr><th>ID</th><th>Symbol</th><th>Side</th><th>Price</th><th>Time</th><th>Ref</th><th>PNL%</th><th>ClosedAt</th></tr>
+      {''.join(rows)}
+    </table>
+    </body></html>
+    """
+    return HTMLResponse(html)
 
-    html.append("</body></html>")
-    return "".join(html)
+# ─────────────────────────────────────────────────────────────
+# Cron
+# ─────────────────────────────────────────────────────────────
+def _should_send_daily_summary() -> bool:
+    # هر بار که /cron صدا زده می‌شود، بررسی کن آیا در بازه 23:30 تهران هستیم (±2 دقیقه)
+    tehran_now = to_tehran(now_dt())
+    hh, mm = tehran_now.hour, tehran_now.minute
+    return (hh == 23 and 28 <= mm <= 32)  # حول‌وحوش 23:30
+
+def _daily_summary_message():
+    d1 = _stats_since_days(1)
+    # بهترین سیگنال روز (بیشترین سود مثبت)
+    best = db_exec(
+        "SELECT symbol, side, pnl_pct, closed_at FROM signals "
+        "WHERE (side='CLOSE_LONG' OR side='CLOSE_SHORT') AND pnl_pct IS NOT NULL "
+        "AND closed_at >= NOW() - INTERVAL '1 day' "
+        "ORDER BY pnl_pct DESC LIMIT 1"
+    )
+    best_line = "—"
+    if best:
+        b = best[0]
+        best_line = f"{b['symbol']} | {side_fa(b['side'])} | +{round(b['pnl_pct'],2)}٪"
+
+    msg = (
+        "🟢 *خلاصه روزانه سیگنال‌ها*\n"
+        f"• تعداد معاملات بسته‌شده: {d1['total']}\n"
+        f"• درصد موفقیت (WinRate): {d1['winrate']}٪\n"
+        f"• بهترین سیگنال روز: {best_line}\n"
+        f"• سود تجمعی اگر همه اجرا می‌شد: +{d1['sum_profit_pos']}٪\n"
+        "_این آمار بر اساس معاملات بسته‌شدهٔ ۲۴ ساعت اخیر محاسبه شده است._"
+    )
+    return msg
+
+@app.get("/cron")
+@app.head("/cron")
+def cron(token: str = Query(default="")):
+    if token != CRON_TOKEN:
+        return JSONResponse({"detail": "forbidden"}, status_code=403)
+
+    # بک‌فیل PNL (در صورت نیاز)
+    try:
+        backfill_missing_pnl()
+    except Exception:
+        pass
+
+    # خلاصه روزانه ساعت ۲۳:۳۰ تهران
+    if _should_send_daily_summary():
+        users = db_exec("SELECT id FROM users WHERE expires_at IS NOT NULL AND expires_at >= NOW()")
+        if users:
+            msg = _daily_summary_message()
+            for u in users:
+                tg_send(u["id"], msg)
+
+    return {"ok": True}
+
+# ─────────────────────────────────────────────────────────────
+# Root
+# ─────────────────────────────────────────────────────────────
+@app.get("/")
+def root():
+    return JSONResponse({"status": "not found"}, status_code=404)
