@@ -71,40 +71,39 @@ def db_exec(q, args=()):
                 return None
 
 def init_db():
+    # جدول users (همون قبلی شما)
     db_exec("""
-    CREATE TABLE IF NOT EXISTS users(
-        telegram_id BIGINT PRIMARY KEY,
-        username TEXT, first_name TEXT, last_name TEXT,
-        joined_at TIMESTAMPTZ,
-        trial_started_at TIMESTAMPTZ,
-        subscription_expires_at TIMESTAMPTZ,
-        referred_by TEXT,
-        is_admin BOOLEAN DEFAULT FALSE,
-        awaiting_tx BOOLEAN DEFAULT FALSE
-    );
+    CREATE TABLE IF NOT EXISTS users (
+        id BIGINT PRIMARY KEY,
+        expires_at TIMESTAMPTZ,
+        awaiting_tx BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )
     """)
-    db_exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS awaiting_tx BOOLEAN DEFAULT FALSE;")
+
+    # جدول signals (حداقل ستون‌های پایه)
     db_exec("""
-    CREATE TABLE IF NOT EXISTS signals(
-        id BIGSERIAL PRIMARY KEY,
-        symbol TEXT, side TEXT, price DOUBLE PRECISION,
-        time TEXT, created_at TIMESTAMPTZ,
-        ref_open_id BIGINT
-    );
+    CREATE TABLE IF NOT EXISTS signals (
+        id SERIAL PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,              -- LONG | SHORT | CLOSE_LONG | CLOSE_SHORT
+        price DOUBLE PRECISION NOT NULL,
+        time TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )
     """)
-    db_exec("""
-    CREATE TABLE IF NOT EXISTS payments(
-        id BIGSERIAL PRIMARY KEY,
-        telegram_id BIGINT, txid TEXT,
-        status TEXT, created_at TIMESTAMPTZ
-    );
-    """)
-    db_exec("""
-    CREATE TABLE IF NOT EXISTS meta(
-        key TEXT PRIMARY KEY,
-        value TEXT
-    );
-    """)
+
+def migrate_db():
+    # ستون‌هایی که نسخه‌های جدید کد نیاز دارند:
+    db_exec("ALTER TABLE signals ADD COLUMN IF NOT EXISTS ref_open_id INTEGER")
+    db_exec("ALTER TABLE signals ADD COLUMN IF NOT EXISTS pnl_pct DOUBLE PRECISION")
+    db_exec("ALTER TABLE signals ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ")
+
+    # ایندکس‌های مفید (اختیاری ولی بهتره):
+    db_exec("CREATE INDEX IF NOT EXISTS idx_signals_time ON signals(time)")
+    db_exec("CREATE INDEX IF NOT EXISTS idx_signals_ref ON signals(ref_open_id)")
+
+
     # seed admins
     now = now_dt()
     for aid in ADMIN_IDS:
@@ -329,7 +328,7 @@ class TVPayload(BaseModel):
 
 # ===================== STARTUP =====================
 init_db()
-
+migrate_db()
 # ===================== ROUTES =====================
 # Health: GET + HEAD
 @app.get("/health")
